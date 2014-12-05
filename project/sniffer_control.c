@@ -212,6 +212,9 @@ int main(int argc, char **argv)
 		strcpy(entry->dev_file, optarg);
                 break;
 	    case 7:    //interface
+		entry->interface=(char*)malloc(40);
+		memset(entry->interface, '\0', 40);
+		strcpy(entry->interface, optarg);
 		printf("======7:=====\n");
 		break;
             case 8:    //direction
