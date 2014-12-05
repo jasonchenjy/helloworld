@@ -206,7 +206,7 @@ static struct hash_value* hash_get(uint32_t dst_ip, uint32_t src_ip, uint16_t sr
 
 	while(tmp){
 		
-		if(tmp->dst_ip==dst_ip && tmp->src_ip==src_ip && tmp->src_port==src_port && tmp->dst_port==dst_port && tmp->protocol==protocol && (tmp->direction==direction || direction == -1)){
+		if((tmp->dst_ip==dst_ip ) && (tmp->src_ip==src_ip ) && (tmp->src_port==src_port ) && (tmp->dst_port==dst_port) && (tmp->protocol==protocol) && (tmp->direction==direction || direction == -1)){
 			return tmp;
 		}
 		tmp=tmp->next;
@@ -216,16 +216,22 @@ static struct hash_value* hash_get(uint32_t dst_ip, uint32_t src_ip, uint16_t sr
 }
 
 static int hash_update(uint32_t dst_ip, uint32_t src_ip, uint16_t src_port, uint16_t dst_port, __u8 protocol, int direction, int enable){
+	//printk(KERN_DEBUG "dip: %d, sip: %d, sport: %d, dport: %d, prot: %d, direction: %d\n", dst_ip, src_ip, src_port, dst_port, protocol, direction);
 	struct hash_value* value = hash_get(dst_ip, src_ip, src_port, dst_port, protocol, direction);
-	if(value==NULL) return 0;
+	if(value==NULL){
+		
+		return 0;
+	}
 	if(enable==1){ //enable
 		if(value->state<0) {
 			value->state = 0;
+			printk(KERN_DEBUG "==to enable==\n");
 		}
 	}
 	else{
 		if(value->state>=0) {
 			value->state = -1;
+			printk(KERN_DEBUG "==to disable==\n");
 		}
 	}
 	return 1;
@@ -287,7 +293,7 @@ static int tcp_stateful(uint32_t dst_ip, uint32_t src_ip, uint16_t src_port, uin
 			if(state == 2){
 				value->state=3;
 			}
-			else if(state == 5) value->state=0;
+			else if(state == 5) value->state=-1;
 			return 1;
 		}
 		if(f==FIN){
@@ -326,7 +332,7 @@ static int tcp_stateful(uint32_t dst_ip, uint32_t src_ip, uint16_t src_port, uin
 		}
 		if(f==ACK){
 			if(state == 0) return 0;
-			if(state == 5) value->state=0;
+			if(state == 5) value->state=-1;
 			return 1;
 		}
 		if(f==FIN){
@@ -431,7 +437,7 @@ static int sniffer_fs_release(struct inode *inode, struct file *file)
     return 0;
 }
 
-static void add_to_list(uint32_t dst_ip, uint32_t src_ip, uint16_t src_port, uint16_t dst_port, int action, int enable, int direction, int protocol)
+static void add_to_list(uint32_t dst_ip, uint32_t src_ip, uint16_t src_port, uint16_t dst_port, int action, int enable, int direction, int protocol, char* interface)
 {
 	int exist=0;
 	struct list_head* p;
@@ -457,6 +463,11 @@ static void add_to_list(uint32_t dst_ip, uint32_t src_ip, uint16_t src_port, uin
 		entry->dst_port=dst_port;
 		entry->action=action;
 		entry->enable=enable;
+
+		entry->interface=(char*)kmalloc(10, GFP_ATOMIC);
+		memset(entry->interface, '\0', 10);
+		strcpy(entry->interface, interface);
+
 		entry->direction=direction;
 		entry->protocol=protocol;
 		list_add(&entry->list, &rule);
@@ -490,16 +501,18 @@ static long sniffer_fs_ioctl(struct file *file, unsigned int cmd, unsigned long 
         return -EFAULT;
 	
     printk(KERN_DEBUG "====command: %d====\n", cmd);
-    printk(KERN_DEBUG "struct: dst_ip: %d, src_ip: %d, dst_port: %d, src_port: %d, action: %d, dev_file: %s, direction: %d, protocol: %d\n", entry->dst_ip, entry->src_ip, entry->dst_port, entry->src_port, entry->action, entry->dev_file, entry->direction, entry->protocol);
+    printk(KERN_DEBUG "struct: dst_ip: %d, src_ip: %d, dst_port: %d, src_port: %d, action: %d, dev_file: %s, direction: %d, protocol: %d interface: %s\n", entry->dst_ip, entry->src_ip, entry->dst_port, entry->src_port, entry->action, entry->dev_file, entry->direction, entry->protocol, entry->interface);
     switch(cmd) {
     case SNIFFER_FLOW_ENABLE:
-	add_to_list(entry->dst_ip, entry->src_ip, entry->src_port, entry->dst_port, entry->action, 1, entry->direction, entry->protocol);
+	add_to_list(entry->dst_ip, entry->src_ip, entry->src_port, entry->dst_port, entry->action, 1, entry->direction, entry->protocol, entry->interface);
+	hash_update(entry->dst_ip, entry->src_ip, entry->src_port, entry->dst_port, entry->protocol, entry->direction, 1);
 	printk(KERN_DEBUG "Enable!!!!====");
         // TODO
         break;
     case SNIFFER_FLOW_DISABLE:
 	printk(KERN_DEBUG "Disable!!!!====");
-	add_to_list(entry->dst_ip, entry->src_ip, entry->src_port, entry->dst_port, entry->action, 0, entry->direction, entry->protocol);
+	add_to_list(entry->dst_ip, entry->src_ip, entry->src_port, entry->dst_port, entry->action, 0, entry->direction, entry->protocol, entry->interface);
+	hash_update(entry->dst_ip, entry->src_ip, entry->src_port, entry->dst_port, entry->protocol, entry->direction, 0);
         // TODO
         break;
     default:
@@ -609,13 +622,17 @@ static unsigned int sniffer_nf_hook(unsigned int hook, struct sk_buff* skb,
     printk(KERN_DEBUG "indev: %x\n", indev);
     printk(KERN_DEBUG "outdev: %x\n", outdev);
     
+
+    struct net_device * device;
     int direction = -1;  // -1:any 0:in 1: out 
     if(indev==NULL){
 	direction = 1;
+	device=outdev->name;
     }else{
 	direction = 0;
+	device=indev->name;
     }	
-    printk(KERN_DEBUG "========= %d ==========\n", direction);
+    printk(KERN_DEBUG "========= %d =======device: %s===\n", direction, device);
 
     struct iphdr *iph = ip_hdr(skb);
     if (iph->protocol == IPPROTO_UDP) {
@@ -639,7 +656,7 @@ static unsigned int sniffer_nf_hook(unsigned int hook, struct sk_buff* skb,
 		{
 			
 			entry=list_entry(p, struct list_entry, list);
-			printk(KERN_DEBUG "direction: %d, protocol: %d, interface: \n", entry->direction, entry->protocol);
+			printk(KERN_DEBUG "direction: %d, protocol: %d, interface: %s\n", entry->direction, entry->protocol, entry->interface);
 			if((entry->dst_ip==ntohl(iph->daddr) || entry->dst_ip==0) &&
 				(entry->src_ip==ntohl(iph->saddr) || entry->src_ip==0) && 
 				(entry->src_port==ntohs(udph->source) || entry->src_port==0) && 
