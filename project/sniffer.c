@@ -66,10 +66,33 @@ struct list_entry
     uint32_t src_ip;
     uint16_t src_port;
     uint16_t dst_port;
+    char* interface;
+    int protocol;  //0: udp 1:icmp 2:tcp
+    int direction; //-1: any 0: in 1: out
     int action;
     int enable;
 };
 
+struct hash_value{
+	uint32_t dst_ip;
+	uint32_t src_ip; 
+	uint16_t src_port; 
+	uint16_t dst_port;
+	__u8 protocol;
+	int direction; //0: in 1: out
+	int state;
+	/*state:
+		0 - DEAD
+		1 - SYN
+		2 - SYNACK
+		3 - ACK
+		4 - ACK with some data - data transfer
+		5 - RST sent
+		6 - FIN received
+		7 - RST received
+	*/
+	struct hash_value* next;
+};
 
 
 
@@ -86,7 +109,249 @@ static inline struct udp * ip_udp_hdr(struct iphdr *iph)
     return udph;
     
 }
+//============= Hash Map =================//
 
+static FLAG get_flag(struct tcphdr *tcph){
+	FLAG f=UNKNOWN;
+	if(tcph->syn){
+		if(tcph->ack){
+			f=SYNACK;
+		}else{
+			f=SYN;
+		}
+	}else if(tcph->fin){
+		f=FIN;
+	}else if(tcph->ack){
+		f=ACK;
+	}else if(tcph->rst){
+		f=RST;
+	}
+	return f;
+};
+
+
+static int hash_fun(uint32_t dst_ip, uint32_t src_ip, uint16_t src_port, uint16_t dst_port, __u8 protocol, int direction){
+	int hc=dst_ip ^ src_ip ^ src_port ^ dst_port^protocol ^ direction;
+	if(hc<0){
+		hc=hc*(-1);
+	}
+        return hc % HASH_MAP_SIZE;
+}
+
+static struct chain* chain_new(){
+  	struct chain* C = (struct chain*)vmalloc(sizeof(struct chain));
+ 	C->list = NULL;
+  	return C;
+}
+
+static int hash_delete(uint32_t dst_ip, uint32_t src_ip, uint16_t src_port, uint16_t dst_port,  __u8 protocol, int direction){
+	if(STATE_MAP==NULL) return 0;
+	int key=hash_fun(dst_ip, src_ip, src_port, dst_port, protocol, direction);
+	if (&(STATE_MAP->array[key]) == NULL){
+		return 0;
+	}
+	struct hash_value* tmp=STATE_MAP->array[key].list;
+	if(tmp==NULL) return 0;
+	if(tmp->dst_ip==dst_ip && tmp->src_ip==src_ip && tmp->src_port==src_port && tmp->dst_port==dst_port && tmp->protocol==protocol && tmp->direction==direction){
+		STATE_MAP->array[key].list=tmp->next;
+		vfree(tmp);
+		return 1;
+	}
+	struct hash_value* pre=tmp;
+	struct hash_value* cur=pre->next;
+	while(cur!=NULL && !(cur->dst_ip==dst_ip && cur->src_ip==src_ip && cur->src_port==src_port && cur->dst_port==dst_port && cur->protocol==protocol && cur->direction==direction)){
+		pre=pre->next;
+		cur=pre->next;
+	}
+	if(cur==NULL) 	return 0;
+	else{
+		pre->next=cur->next;
+		vfree(cur);
+		return 1;
+	}
+}
+
+
+static void hash_insert(__u8 protocol, int state, int direction, uint32_t dst_ip, uint32_t src_ip, uint16_t src_port, uint16_t dst_port){
+	if(STATE_MAP==NULL) return;
+	int key=hash_fun(dst_ip, src_ip, src_port, dst_port, protocol, direction);	
+
+	if (&(STATE_MAP->array[key]) == NULL){
+		STATE_MAP->array[key] = *(chain_new());
+	}
+	struct chain* C=STATE_MAP->array+key;
+	struct hash_value* data=(struct hash_value*)kmalloc(sizeof(struct hash_value), GFP_ATOMIC);
+	data->dst_ip=dst_ip;
+	data->src_ip=src_ip; 
+	data->src_port=src_port; 
+	data->dst_port=dst_port;
+	data->protocol=protocol;
+	data->direction=direction;
+	data->state = state;
+	data->next = C->list;
+        C->list = data;
+
+	return;
+}
+
+static struct hash_value* hash_get(uint32_t dst_ip, uint32_t src_ip, uint16_t src_port, uint16_t dst_port, __u8 protocol, int direction){
+	if(STATE_MAP==NULL){
+		return NULL;
+	}
+	int key=hash_fun(dst_ip, src_ip, src_port, dst_port, protocol, direction);
+	if (&(STATE_MAP->array[key]) == NULL){
+		return NULL;
+	}
+	struct hash_value* tmp=STATE_MAP->array[key].list;
+
+	while(tmp){
+		
+		if(tmp->dst_ip==dst_ip && tmp->src_ip==src_ip && tmp->src_port==src_port && tmp->dst_port==dst_port && tmp->protocol==protocol && (tmp->direction==direction || direction == -1)){
+			return tmp;
+		}
+		tmp=tmp->next;
+	}
+
+	return NULL;
+}
+
+static int hash_update(uint32_t dst_ip, uint32_t src_ip, uint16_t src_port, uint16_t dst_port, __u8 protocol, int direction, int enable){
+	struct hash_value* value = hash_get(dst_ip, src_ip, src_port, dst_port, protocol, direction);
+	if(value==NULL) return 0;
+	if(enable==1){ //enable
+		if(value->state<0) {
+			value->state = 0;
+		}
+	}
+	else{
+		if(value->state>=0) {
+			value->state = -1;
+		}
+	}
+	return 1;
+
+}
+
+static void create_hash_map(int init_size){
+	STATE_MAP=(struct state_HashMap*)kmalloc(sizeof(struct state_HashMap), GFP_ATOMIC);
+	struct chain* A = (struct chain*)vmalloc(init_size*sizeof(struct chain));
+	int i=0;
+	for(i=0;i<init_size;i++){
+		(A+i)->list=NULL;
+	}
+	STATE_MAP->array=A;
+	printk(KERN_DEBUG "================Create Hash Map================\n");
+}
+
+static int udp_icmp_stateful(uint32_t dst_ip, uint32_t src_ip, uint16_t src_port, uint16_t dst_port, __u8 protocol, int direction){
+	
+	struct hash_value* value = hash_get(dst_ip, src_ip, src_port, dst_port, protocol, direction);
+	if(value==NULL) return 0;
+	if(value->state==-1) return 0;
+	return 1;
+}
+
+
+
+static int tcp_stateful(uint32_t dst_ip, uint32_t src_ip, uint16_t src_port, uint16_t dst_port, struct tcphdr *tcph, __u8 protocol, int direction){
+	FLAG f = get_flag(tcph);
+	struct hash_value* value = hash_get(dst_ip, src_ip, src_port, dst_port, protocol, direction);
+	if(f==ACK){
+		printk(KERN_DEBUG "ACK\n");
+	}
+	else if(f==FIN){
+		printk(KERN_DEBUG "FIN\n");
+	}
+	else if(f==RST){
+		printk(KERN_DEBUG "RST\n");
+	}
+	else if(f==SYNACK){
+		printk(KERN_DEBUG "SYNACK\n");
+	}
+	else if(f==SYN){
+		printk(KERN_DEBUG "SYN\n");
+	}
+	
+	if(value!=NULL){
+		// right direction
+		printk(KERN_DEBUG "right direction:===STATE: %d \n", value->state);
+		int state = value->state;
+		if(state==-1) return 0; // no longer available
+		if(f==SYN){
+			if(state == 0){
+				value->state=1;
+			}
+			return 1;
+		}
+		if(f==ACK){
+			if(state == 2){
+				value->state=3;
+			}
+			else if(state == 5) value->state=0;
+			return 1;
+		}
+		if(f==FIN){
+			if(state == 0) return 0;
+			if(state == 4){
+				printk(KERN_DEBUG "REMOVE 22:\n");
+				//int out = hash_delete(dst_ip, src_ip, src_port, dst_port);
+				value->state=5;
+			}else{
+				value->state=4;
+			}
+			return 1;
+		}
+		if(f==RST){
+			printk(KERN_DEBUG "Reset!!\n");
+			value->state=0;
+			return 1;
+		}
+		return 0;
+	}
+	value = hash_get(src_ip, dst_ip, dst_port, src_port, protocol, 1-direction);
+	if(value!=NULL){
+		printk(KERN_DEBUG "reverse direction:====STATE: %d\n", value->state);
+		// reverse direction
+		int state = value->state;
+		if(state==-1) return 0; // no longer available
+		if(f==SYN){
+			return 1;
+		}
+		if(f==SYNACK){
+			if(state == 0) return 0;
+			else if(state == 1){
+				value->state=2;
+			}
+			return 1;
+		}
+		if(f==ACK){
+			if(state == 0) return 0;
+			if(state == 5) value->state=0;
+			return 1;
+		}
+		if(f==FIN){
+			if(state == 0) return 0;
+			if(state == 4){
+				printk(KERN_DEBUG "REMOVE 22:\n");
+				//int out = hash_delete(src_ip, dst_ip, dst_port, src_port);
+				value->state=5;
+			}else{
+				value->state=4;
+			}
+			return 1;
+		}
+		if(f==RST){
+			printk(KERN_DEBUG "Reset!!\n");
+			//hash_delete(src_ip, dst_ip, dst_port, src_port);
+			value->state=0;
+			return 1;
+		}
+		return 0;
+	}
+	printk(KERN_DEBUG "NOT IN HASH\n");
+	return 0;
+	
+}
 
 /* From kernel to userspace */
 static ssize_t 
@@ -166,7 +431,7 @@ static int sniffer_fs_release(struct inode *inode, struct file *file)
     return 0;
 }
 
-static void add_to_list(uint32_t dst_ip, uint32_t src_ip, uint16_t src_port, uint16_t dst_port, int action, int enable)
+static void add_to_list(uint32_t dst_ip, uint32_t src_ip, uint16_t src_port, uint16_t dst_port, int action, int enable, int direction, int protocol)
 {
 	int exist=0;
 	struct list_head* p;
@@ -174,7 +439,7 @@ static void add_to_list(uint32_t dst_ip, uint32_t src_ip, uint16_t src_port, uin
 	list_for_each(p, &rule)
 	{
 		entry=list_entry(p, struct list_entry, list);
-		if(entry->dst_ip==dst_ip && entry->src_ip==src_ip && entry->src_port==src_port && entry->dst_port==dst_port)
+		if(entry->dst_ip==dst_ip && entry->src_ip==src_ip && entry->src_port==src_port && entry->dst_port==dst_port && entry->direction==direction && entry->protocol==protocol)
 		{
 			exist=1;
 			break;
@@ -192,13 +457,17 @@ static void add_to_list(uint32_t dst_ip, uint32_t src_ip, uint16_t src_port, uin
 		entry->dst_port=dst_port;
 		entry->action=action;
 		entry->enable=enable;
-		list_add_tail(&entry->list, &rule);
+		entry->direction=direction;
+		entry->protocol=protocol;
+		list_add(&entry->list, &rule);
 	}
 	//if(action==SNIFFER_ACTION_CAPTURE){
 		//entry->skb=(struct sk_buff*)vmalloc(sizeof(struct sk_buff));
 	//}
 
 }
+
+
 
 
 static long sniffer_fs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
@@ -221,16 +490,16 @@ static long sniffer_fs_ioctl(struct file *file, unsigned int cmd, unsigned long 
         return -EFAULT;
 	
     printk(KERN_DEBUG "====command: %d====\n", cmd);
-    printk(KERN_DEBUG "struct: dst_ip: %d, src_ip: %d, dst_port: %d, src_port: %d, action: %d, dev_file: %s\n", entry->dst_ip, entry->src_ip, entry->dst_port, entry->src_port, entry->action, entry->dev_file);
+    printk(KERN_DEBUG "struct: dst_ip: %d, src_ip: %d, dst_port: %d, src_port: %d, action: %d, dev_file: %s, direction: %d, protocol: %d\n", entry->dst_ip, entry->src_ip, entry->dst_port, entry->src_port, entry->action, entry->dev_file, entry->direction, entry->protocol);
     switch(cmd) {
     case SNIFFER_FLOW_ENABLE:
-	add_to_list(entry->dst_ip, entry->src_ip, entry->src_port, entry->dst_port, entry->action, 1);
+	add_to_list(entry->dst_ip, entry->src_ip, entry->src_port, entry->dst_port, entry->action, 1, entry->direction, entry->protocol);
 	printk(KERN_DEBUG "Enable!!!!====");
         // TODO
         break;
     case SNIFFER_FLOW_DISABLE:
 	printk(KERN_DEBUG "Disable!!!!====");
-	add_to_list(entry->dst_ip, entry->src_ip, entry->src_port, entry->dst_port, entry->action, 0);
+	add_to_list(entry->dst_ip, entry->src_ip, entry->src_port, entry->dst_port, entry->action, 0, entry->direction, entry->protocol);
         // TODO
         break;
     default:
@@ -328,37 +597,69 @@ static const struct file_operations  proc_fops = {
      .open  = sproc_open,
  };
 
+
+
+
+
 static unsigned int sniffer_nf_hook(unsigned int hook, struct sk_buff* skb,
         const struct net_device *indev, const struct net_device *outdev,
         int (*okfn) (struct sk_buff*))
 {
 
-    struct iphdr *iph = ip_hdr(skb);
+    printk(KERN_DEBUG "indev: %x\n", indev);
+    printk(KERN_DEBUG "outdev: %x\n", outdev);
+    
+    int direction = -1;  // -1:any 0:in 1: out 
+    if(indev==NULL){
+	direction = 1;
+    }else{
+	direction = 0;
+    }	
+    printk(KERN_DEBUG "========= %d ==========\n", direction);
 
+    struct iphdr *iph = ip_hdr(skb);
     if (iph->protocol == IPPROTO_UDP) {
+		printk(KERN_DEBUG "========= IN UDP ==========\n");
 		struct udphdr *udph = ip_udp_hdr(iph);
+/*
 		if (ntohs(udph->dest) == 53)
             		return NF_ACCEPT;
 		if (ntohs(udph->source) == 53)
             		return NF_ACCEPT;
+*/
+
+		int in_hash=udp_icmp_stateful(ntohl(iph->daddr), ntohl(iph->saddr), ntohs(udph->source), ntohs(udph->dest), iph->protocol, direction);
+		if(in_hash){ return NF_ACCEPT;}
+		else {printk(KERN_DEBUG "===Not in UDP ICMP HASH MAP===\n");}
 
  		struct list_head* p;
 		struct list_entry* entry;
 		
 		list_for_each(p, &rule)
 		{
+			
 			entry=list_entry(p, struct list_entry, list);
+			printk(KERN_DEBUG "direction: %d, protocol: %d, interface: \n", entry->direction, entry->protocol);
 			if((entry->dst_ip==ntohl(iph->daddr) || entry->dst_ip==0) &&
 				(entry->src_ip==ntohl(iph->saddr) || entry->src_ip==0) && 
 				(entry->src_port==ntohs(udph->source) || entry->src_port==0) && 
-				(entry->dst_port==ntohs(udph->dest) || entry->dst_port==0))
+				(entry->dst_port==ntohs(udph->dest) || entry->dst_port==0) &&
+				(entry->protocol==0) && 
+				(entry->direction==direction || entry->direction ==-1))
 			{
 				if(entry->enable==1)
 				{
-					printk(KERN_DEBUG "ENABLE!!! =======\n");
 
+					struct hash_value* value= hash_get(ntohl(iph->daddr), ntohl(iph->saddr), ntohs(udph->source), ntohs(udph->dest), iph->protocol, direction);
+					if(value!=NULL){
+						printk(KERN_DEBUG "Exist change state!!! ===\n");
+						value->state=1;
+					}else{
+						hash_insert(iph->protocol, 1, direction, ntohl(iph->daddr), ntohl(iph->saddr), ntohs(udph->source), ntohs(udph->dest));
+						printk(KERN_DEBUG "Insert!!! =======\n");
+					}
 
-
+					printk(KERN_DEBUG "UDP ENABLE!!! =======\n");
 					return NF_ACCEPT;
 				}
 				else{
@@ -370,6 +671,12 @@ static unsigned int sniffer_nf_hook(unsigned int hook, struct sk_buff* skb,
 
 
     }else if (iph->protocol == IPPROTO_ICMP) {	
+		printk(KERN_DEBUG "========= IN ICMP ==========\n");
+
+		int in_hash=udp_icmp_stateful(ntohl(iph->daddr), ntohl(iph->saddr), 0, 0, iph->protocol, direction);
+		if(in_hash){ return NF_ACCEPT;}
+		else {printk(KERN_DEBUG "===Not in UDP ICMP HASH MAP===\n");}
+
 		struct list_head* p;
 		struct list_entry* entry;
 		
@@ -377,11 +684,22 @@ static unsigned int sniffer_nf_hook(unsigned int hook, struct sk_buff* skb,
 		{
 			entry=list_entry(p, struct list_entry, list);
 			if((entry->dst_ip==ntohl(iph->daddr) || entry->dst_ip==0) &&
-				(entry->src_ip==ntohl(iph->saddr) || entry->src_ip==0))
+				(entry->src_ip==ntohl(iph->saddr) || entry->src_ip==0) &&
+				(entry->protocol==1) && 
+				(entry->direction==direction || entry->direction ==-1) )
 			{
 				if(entry->enable==1)
 				{
-					printk(KERN_DEBUG "ENABLE!!! =======\n");
+
+					struct hash_value* value= hash_get(ntohl(iph->daddr), ntohl(iph->saddr), 0,0, iph->protocol, direction);
+					if(value!=NULL){
+						printk(KERN_DEBUG "Exist change state!!! ===\n");
+						value->state=1;
+					}else{
+						hash_insert(iph->protocol, 1, direction, ntohl(iph->daddr), ntohl(iph->saddr),0, 0);
+					}
+
+					printk(KERN_DEBUG "ICMP ENABLE!!! =======\n");
 					return NF_ACCEPT;
 				}
 				else{
@@ -395,31 +713,41 @@ static unsigned int sniffer_nf_hook(unsigned int hook, struct sk_buff* skb,
     }else if (iph->protocol == IPPROTO_TCP) {
         struct tcphdr *tcph = ip_tcp_hdr(iph);
 
-	//printk(KERN_DEBUG "From IP address: %d.%d.%d.%d\n", (ntohl(iph->saddr)& 0xff000000)>>24, (ntohl(iph->saddr)& 0x00ff0000) >> 16,(ntohl(iph->saddr)& 0x0000ff00) >> 8, (ntohl(iph->saddr)& 0x000000ff));
+	printk(KERN_DEBUG "Destination IP address: %d.%d.%d.%d\n", (ntohl(iph->daddr)& 0xff000000)>>24, (ntohl(iph->daddr)& 0x00ff0000) >> 16,(ntohl(iph->daddr)& 0x0000ff00) >> 8, (ntohl(iph->daddr)& 0x000000ff));
 
         if (ntohs(tcph->dest) == 22)
             	return NF_ACCEPT;
 
         if (ntohs(tcph->dest ) != 22) 
 	{
+		int in_hash = tcp_stateful(ntohl(iph->daddr), ntohl(iph->saddr), ntohs(tcph->source), ntohs(tcph->dest), tcph, iph->protocol, direction);
+		if(in_hash){
+			return NF_ACCEPT;
+		}
+
+
             	struct list_head* p;
 		struct list_entry* entry;
 		
 		list_for_each(p, &rule)
 		{
 			entry=list_entry(p, struct list_entry, list);
-			
+			//printk(KERN_DEBUG "From IP address: %d.%d.%d.%d\n", ((entry->dst_ip)& 0xff000000)>>24, ((entry->dst_ip)& 0x00ff0000) >> 16,((entry->dst_ip)& 0x0000ff00) >> 8, ((entry->dst_ip)& 0x000000ff));
+			printk(KERN_DEBUG "direction: %d, protocol: %d, interface: \n", entry->direction, entry->protocol);
 			if((entry->dst_ip==ntohl(iph->daddr) || entry->dst_ip==0) &&
 				(entry->src_ip==ntohl(iph->saddr) || entry->src_ip==0) && 
 				(entry->src_port==ntohs(tcph->source) || entry->src_port==0) && 
-				(entry->dst_port==ntohs(tcph->dest) || entry->dst_port==0))
+				(entry->dst_port==ntohs(tcph->dest) || entry->dst_port==0) &&
+				(entry->protocol==2) &&
+				(entry->direction==direction || entry->direction ==-1))
 			{
+				printk(KERN_DEBUG "FIND!!!!!!\n");
 				if(entry->action==SNIFFER_ACTION_CAPTURE)
 				{
 					
 				     	struct skb_list* tmp=(struct skb_list*)kmalloc(sizeof(struct skb_list), GFP_ATOMIC);								tmp->skb=skb_copy(skb, GFP_ATOMIC);
 					down_interruptible(&dev_sem);
-					list_add_tail(&tmp->list, &skbs);
+					list_add(&tmp->list, &skbs);
 					up(&dev_sem);
 					if(list_is_last(&tmp->list, &skbs))
 						wake_up_interruptible(&readqueue);
@@ -468,10 +796,19 @@ static unsigned int sniffer_nf_hook(unsigned int hook, struct sk_buff* skb,
                         		}
                    
 				}
-				printk(KERN_DEBUG "Find!!! =======enable: %d\n", entry->enable);
+				printk(KERN_DEBUG "ip: %d, enable: %d", entry->dst_ip, entry->enable);
 				if(entry->enable==1)
 				{
-					printk(KERN_DEBUG "ENABLE!!! =======\n");
+					FLAG f = get_flag(tcph);
+					if(f!=SYN) return NF_DROP;
+					struct hash_value* value= hash_get(ntohl(iph->daddr), ntohl(iph->saddr), ntohs(tcph->source), ntohs(tcph->dest), iph->protocol, direction);
+					if(value!=NULL){
+						printk(KERN_DEBUG "Exist change state!!! ===\n");
+						value->state=1;
+					}else{
+						hash_insert(iph->protocol, 1, direction, ntohl(iph->daddr), ntohl(iph->saddr), ntohs(tcph->source), ntohs(tcph->dest));
+						printk(KERN_DEBUG "INSERT!!! ====\n");
+					}
 					return NF_ACCEPT;
 				}
 				else
@@ -489,93 +826,6 @@ static unsigned int sniffer_nf_hook(unsigned int hook, struct sk_buff* skb,
     return NF_ACCEPT;
 }
 
-static int hash_fun(uint32_t dst_ip, uint32_t src_ip, uint16_t src_port, uint16_t dst_port){
-	int hc=dst_ip ^ src_ip ^ src_port ^ dst_port;
-	if(hc<0){
-		hc=hc*(-1);
-	}
-        return hc % HASH_MAP_SIZE;
-}
-
-static struct chain* chain_new(){
-  	struct chain* C = (struct chain*)vmalloc(sizeof(struct chain));
- 	C->list = NULL;
-  	return C;
-}
-
-static int hash_delete(uint32_t dst_ip, uint32_t src_ip, uint16_t src_port, uint16_t dst_port){
-	if(STATE_MAP==NULL) return;
-	int key=hash_fun(dst_ip, src_ip, src_port, dst_port);
-	if (&(STATE_MAP->array[key]) == NULL){
-		return 0;
-	}
-	struct hash_value* tmp=STATE_MAP->array[key].list;
-	if(tmp->dst_ip==dst_ip && tmp->src_ip==src_ip && tmp->src_port==src_port && tmp->dst_port==dst_port){
-		STATE_MAP->array[key].list=tmp->next;
-		vfree(tmp);
-		return 1;
-	}
-	struct hash_value* pre=tmp;
-	struct hash_value* cur=pre->next;
-	while(cur!=NULL && !(cur->dst_ip==dst_ip && cur->src_ip==src_ip && cur->src_port==src_port && cur->dst_port==dst_port)){
-		pre=pre->next;
-		cur=pre->next;
-	}
-	if(cur==NULL) 	return 0;
-	else{
-		pre->next=cur->next;
-		vfree(cur);
-		return 1;
-	}
-}
-
-
-static void hash_insert(__u8 protocol, int state, int direction, uint32_t dst_ip, uint32_t src_ip, uint16_t src_port, uint16_t dst_port){
-	if(STATE_MAP==NULL) return;
-	int key=hash_fun(dst_ip, src_ip, src_port, dst_port);	
-
-	if (&(STATE_MAP->array[key]) == NULL){
-		STATE_MAP->array[key] = *(chain_new());
-	}
-	struct chain* C=STATE_MAP->array+key;
-	struct hash_value* data=(struct hash_value*)vmalloc(sizeof(struct hash_value));
-	data->dst_ip=dst_ip;
-	data->src_ip=src_ip; 
-	data->src_port=src_port; 
-	data->dst_port=dst_port;
-	data->protocol=protocol;
-	data->direction=direction;
-	data->state = state;
-	data->next = C->list;
-        C->list = data;
-
-	return data;
-}
-
-static struct hash_value* hash_get(uint32_t dst_ip, uint32_t src_ip, uint16_t src_port, uint16_t dst_port){
-	if(STATE_MAP==NULL){
-		return NULL;
-	}
-	int key=hash_fun(dst_ip, src_ip, src_port, dst_port);
-	if (&(STATE_MAP->array[key]) == NULL){
-		return NULL;
-	}
-	struct hash_value* tmp=STATE_MAP->array[key].list;
-	while(tmp){
-		if(tmp->dst_ip==dst_ip && tmp->src_ip==src_ip && tmp->src_port==src_port && tmp->dst_port==dst_port){
-			return tmp;
-		}
-		tmp=tmp->next;
-	}
-	return NULL;
-}
-
-static void create_hash_map(int init_size){
-	STATE_MAP=(struct state_HashMap*)vmalloc(sizeof(struct state_HashMap));
-	struct chain* A = (struct chain*)vmalloc(init_size*sizeof(struct chain));
-	STATE_MAP->array=A;
-
-}
 
 
 static int __init sniffer_init(void)
@@ -658,4 +908,3 @@ static void __exit sniffer_exit(void)
 
 module_init(sniffer_init);
 module_exit(sniffer_exit);
-
