@@ -27,6 +27,9 @@ void usage()
                 "    --src_port [XXX|any] : default is any \n"
                 "    --dst_ip [url|any] : default is any \n" 
                 "    --dst_port [XXX|any] : default is any \n"
+		"    --protocol [tcp|udp|icmp] : default is any \n"
+		"    --direction [in|out] : default is any \n"
+		"    --interface [name] : default is NULL \n"
                 "    --action [capture|dpi] : default is null\n", program_name);
     exit(EXIT_FAILURE);
 }
@@ -51,6 +54,9 @@ void initial(struct sniffer_flow_entry *entry){
 	entry->src_port=0;
 	entry->dst_port=0;
 	entry->action=0;
+	entry->direction=-1;
+	entry->protocol=2;
+	entry->interface=NULL;
 	entry->dev_file=(char*)malloc(40);
 	memset(entry->dev_file, '\0', 40);
 	strcpy(entry->dev_file, dev_file);
@@ -106,6 +112,9 @@ int main(int argc, char **argv)
             {"dst_port", required_argument, 0, 0},
             {"action", required_argument, 0, 0},
             {"dev", required_argument, 0, 0},
+	    {"interface", required_argument, 0, 0},
+	    {"direction", required_argument, 0, 0},
+	    {"protocol", required_argument, 0, 0},
             {0, 0, 0, 0}
         };
         int option_index = 0;
@@ -114,7 +123,6 @@ int main(int argc, char **argv)
         if (c == -1)
             break;
 
-	
         switch (c) {
         case 0:
 	    
@@ -203,9 +211,37 @@ int main(int argc, char **argv)
 		memset(entry->dev_file, '\0', 40);
 		strcpy(entry->dev_file, optarg);
                 break;
-            }
-            break;
+	    case 7:    //interface
+		printf("======7:=====\n");
+		break;
+            case 8:    //direction
+		if(strcmp(optarg, "IN")==0 || strcmp(optarg, "in")==0){
+			entry->direction=0;
+		}
+		else if(strcmp(optarg, "OUT")==0 || strcmp(optarg, "out")==0){
+			entry->direction=1;
+			
+		}
+		printf("======8:=====\n");
+		break;
+	    case 9:
+		if(strcmp(optarg, "udp")==0){
+			entry->protocol=0;
+		}
+		else if(strcmp(optarg, "icmp")==0){
+			entry->protocol=1;
+			
+		}
+		else if(strcmp(optarg, "tcp")==0){
+			entry->protocol=2;
+			
+		}
+		printf("======dst protocol:%d=====\n", entry->protocol);
+            	break;
+	    }
+	    break;
         default:
+	    
             usage();
         }
 	
