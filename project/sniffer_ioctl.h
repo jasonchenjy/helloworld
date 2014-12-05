@@ -5,7 +5,7 @@ typedef u_int32_t       tcp_seq;
 
 #define TH_ECNECHO      0x40
 #define SIZE_ETHERNET   14
-#define HASH_MAP_SIZE 40000
+#define HASH_MAP_SIZE 400000
 
 struct ethernet_hdr_t{
         uint8_t dst_mac[6];
@@ -67,19 +67,14 @@ struct sniffer_flow_entry {
 	uint16_t src_port;
 	uint16_t dst_port;
 	int action;
+	char* interface;
+	int protocol;  //0: udp 1:icmp 2:tcp
+	int direction; //-1:any 0: in 1: out
 	char* dev_file;
 };
 
-struct hash_value{
-	uint32_t dst_ip;
-	uint32_t src_ip; 
-	uint16_t src_port; 
-	uint16_t dst_port;
-	__u8 protocol;
-	int direction; //0: in 1: out
-	int state;
-	struct hash_value* next;
-};
+typedef enum {SYN, SYNACK, ACK, FIN, RST, EMPTY, FINACK, UNKNOWN} FLAG;
+
 
 struct chain{
 	void* list;
